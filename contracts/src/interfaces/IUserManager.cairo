@@ -1,4 +1,4 @@
-use starknet::ContractAddress;
+use starknet::{ContractAddress, secp256_trait::Signature};
 use core::array::Array;
 
 /// User profile data structure
@@ -119,6 +119,24 @@ pub trait IUserManager<TState> {
     /// @return users: Array of user addresses
     fn get_users_paginated(self: @TState, offset: u32, limit: u32) -> Array<ContractAddress>;
 
+    /// Get paginated list of users with a specific role
+    /// @param role: The role to search for
+    /// @param offset: Starting index
+    /// @param limit: Maximum number of users to return
+    /// @return users: Array of user addresses with the role
+    fn get_users_with_role_paginated(
+        self: @TState, role: u8, offset: u32, limit: u32,
+    ) -> Array<ContractAddress>;
+
+    /// Get paginated list of referrals for a specific user
+    /// @param referrer_address: The referrer's wallet address
+    /// @param offset: Starting index
+    /// @param limit: Maximum number of referrals to return
+    /// @return referrals: Array of referred user addresses
+    fn get_user_referrals_paginated(
+        self: @TState, referrer_address: ContractAddress, offset: u32, limit: u32,
+    ) -> Array<ContractAddress>;
+
     // ============ Role Management ============
 
     /// Assign a role to a user (admin only)
@@ -174,6 +192,41 @@ pub trait IUserManager<TState> {
 
     // ============ Authentication & Security ============
 
+    /// Get authentication security configuration
+    /// @return rate_limit: Rate limit in seconds
+    /// @return max_failed_attempts: Maximum number of failed attempts
+    /// @return lockout_duration: Lockout duration in seconds
+    fn get_auth_security_config(self: @TState) -> (u64, u32, u64);
+
+    /// Update authentication security configuration
+    /// @param rate_limit_seconds: New rate limit in seconds
+    /// @param max_failed_attempts: New maximum number of failed attempts
+    /// @param lockout_duration_seconds: New lockout duration in seconds
+    /// @return success: Boolean indicating successful update
+    fn update_auth_security_config(
+        ref self: TState,
+        rate_limit_seconds: u64,
+        max_failed_attempts: u32,
+        lockout_duration_seconds: u64,
+    ) -> bool;
+
+    /// Get user authentication status
+    /// @param user_address: The user's wallet address
+    /// @return failed_attempts: Number of failed authentication attempts
+    /// @return last_attempt_time: Timestamp of last authentication attempt
+    /// @return is_locked_out: Boolean indicating if user is locked out
+    fn get_user_auth_status(self: @TState, user_address: ContractAddress) -> (u32, u64, bool);
+
+    /// Reset user authentication status
+    /// @param user_address: The user's wallet address
+    /// @return success: Boolean indicating successful reset
+    fn reset_user_auth_status(ref self: TState, user_address: ContractAddress) -> bool;
+
+    /// Check if user has an active authentication challenge
+    /// @param user_address: The user's wallet address
+    /// @return has_challenge: Boolean indicating if user has an active challenge
+    fn has_active_challenge(self: @TState, user_address: ContractAddress) -> bool;
+
     /// Generate authentication challenge for user
     /// @param user_address: The user's wallet address
     /// @return challenge_hash: Generated challenge hash
@@ -188,7 +241,7 @@ pub trait IUserManager<TState> {
         ref self: TState,
         user_address: ContractAddress,
         challenge_hash: felt252,
-        signature: Array<felt252>,
+        signature: Signature,
     ) -> bool;
 
     /// Check if user can perform an action (combines registration, active status, and role checks)

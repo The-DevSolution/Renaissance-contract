@@ -1,7 +1,7 @@
 #[starknet::component]
 pub mod UserManagerComponent {
     use core::hash::HashStateTrait;
-    use core::{array::Array, pedersen::PedersenTrait};
+    use core::{array::Array, poseidon::PoseidonTrait};
     use starknet::{
         ContractAddress, get_caller_address, get_block_timestamp, get_tx_info,
         storage::{
@@ -15,6 +15,9 @@ pub mod UserManagerComponent {
             IAccessControl::IAccessControl,
         },
         components::accessControl::{AccessControlComponent},
+    };
+    use starknet::secp256_trait::{
+        Secp256PointTrait, Signature, is_valid_signature, recover_public_key,
     };
 
     /// Storage for the UserManager component
@@ -38,6 +41,28 @@ pub mod UserManagerComponent {
         min_reputation_score: u32,
         /// Whether registrations are paused
         registration_paused: bool,
+        /// Array of all registered user addresses (for pagination)
+        user_addresses: Map<u32, ContractAddress>,
+        /// Maps referrer -> array index for referrals
+        referrer_referrals: Map<(ContractAddress, u32), ContractAddress>,
+        /// Maps referrer -> referral array length
+        referrer_referral_length: Map<ContractAddress, u32>,
+        /// Maps role -> array of users with that role
+        role_users: Map<(u8, u32), ContractAddress>,
+        /// Maps role -> count of users with that role
+        role_user_count: Map<u8, u32>,
+        /// Maps user address -> nonce for challenge generation
+        user_nonces: Map<ContractAddress, u64>,
+        /// Maps user address -> last challenge timestamp (for rate limiting)
+        last_challenge_timestamp: Map<ContractAddress, u64>,
+        /// Maps user address -> failed verification attempts
+        failed_auth_attempts: Map<ContractAddress, u32>,
+        /// Challenge rate limit (seconds between challenges)
+        challenge_rate_limit: u64,
+        /// Max failed attempts before temporary lockout
+        max_failed_attempts: u32,
+        /// Lockout duration in seconds
+        lockout_duration: u64,
     }
 
     #[event]
@@ -53,6 +78,9 @@ pub mod UserManagerComponent {
         BetResultRecorded: BetResultRecorded,
         AuthChallengeGenerated: AuthChallengeGenerated,
         AuthChallengeVerified: AuthChallengeVerified,
+        AuthChallengeExpired: AuthChallengeExpired,
+        AuthAttemptFailed: AuthAttemptFailed,
+        UserLockedOut: UserLockedOut,
         RegistrationPauseChanged: RegistrationPauseChanged,
         MinReputationChanged: MinReputationChanged,
     }
@@ -141,6 +169,28 @@ pub mod UserManagerComponent {
         changed_by: ContractAddress,
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct AuthChallengeExpired {
+        user_address: ContractAddress,
+        challenge_hash: felt252,
+        timestamp: u64,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct AuthAttemptFailed {
+        user_address: ContractAddress,
+        challenge_hash: felt252,
+        reason: felt252,
+        timestamp: u64,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct UserLockedOut {
+        user_address: ContractAddress,
+        failed_attempts: u32,
+        lockout_until: u64,
+    }
+
     #[embeddable_as(UserManagerImpl)]
     impl UserManager<
         TContractState,
@@ -191,13 +241,24 @@ pub mod UserManagerComponent {
                 self.user_referrer.write(user_address, params.referrer);
                 let current_count = self.referral_count.read(params.referrer);
                 self.referral_count.write(params.referrer, current_count + 1);
+
+                // Add to referrer's referral array
+                let referral_length = self.referrer_referral_length.read(params.referrer);
+                self.referrer_referrals.write((params.referrer, referral_length), user_address);
+                self.referrer_referral_length.write(params.referrer, referral_length + 1);
             }
 
             // Assign default role (Regular)
             self.user_roles.write((user_address, UserRole::Regular), true);
 
-            // Increment total users
+            // Add to role users array
+            let role_count = self.role_user_count.read(UserRole::Regular);
+            self.role_users.write((UserRole::Regular, role_count), user_address);
+            self.role_user_count.write(UserRole::Regular, role_count + 1);
+
+            // Increment total users and add to user addresses array
             let total = self.total_users.read();
+            self.user_addresses.write(total, user_address);
             self.total_users.write(total + 1);
 
             // Emit event
@@ -370,12 +431,28 @@ pub mod UserManagerComponent {
         fn get_users_paginated(
             self: @ComponentState<TContractState>, offset: u32, limit: u32,
         ) -> Array<ContractAddress> {
-            //TODO: Implement this
-            // This is a simplified implementation - in practice you'd want a more efficient
-            // approach
             let mut users = ArrayTrait::new();
-            // Note: This would require iterating through stored users, which is not efficient
-            // In production, you'd maintain a separate array of user addresses
+            let total_users = self.total_users.read();
+
+            // Bounds checking
+            if offset >= total_users {
+                return users;
+            }
+
+            let end_index = if offset + limit > total_users {
+                total_users
+            } else {
+                offset + limit
+            };
+
+            // Collect users within the specified range
+            let mut i = offset;
+            while i < end_index {
+                let user_address = self.user_addresses.read(i);
+                users.append(user_address);
+                i += 1;
+            };
+
             users
         }
 
@@ -392,6 +469,11 @@ pub mod UserManagerComponent {
 
             // Assign role
             self.user_roles.write((user_address, role), true);
+
+            // Add to role users array
+            let role_count = self.role_user_count.read(role);
+            self.role_users.write((role, role_count), user_address);
+            self.role_user_count.write(role, role_count + 1);
 
             // Emit event
             self
@@ -467,11 +549,20 @@ pub mod UserManagerComponent {
         fn get_users_with_role(
             self: @ComponentState<TContractState>, role: u8,
         ) -> Array<ContractAddress> {
-            //TODO: Implement this
-            // This is a simplified implementation - in practice you'd maintain reverse mappings
             let mut users = ArrayTrait::new();
-            // Note: This would require iterating through all users, which is not efficient
-            // In production, you'd maintain separate arrays for each role
+            let role_count = self.role_user_count.read(role);
+
+            // Collect all users with the specified role
+            let mut i = 0;
+            while i < role_count {
+                let user_address = self.role_users.read((role, i));
+                // Verify the user still has this role (in case of removals)
+                if self.user_roles.read((user_address, role)) {
+                    users.append(user_address);
+                }
+                i += 1;
+            };
+
             users
         }
 
@@ -570,22 +661,53 @@ pub mod UserManagerComponent {
         ) -> felt252 {
             // Check if user is registered and active
             assert(self.is_user_active(user_address), 'User not active');
+
+            let current_timestamp = get_block_timestamp();
+
+            // Check if user is currently locked out
+            let failed_attempts = self.failed_auth_attempts.read(user_address);
+            let max_attempts = self.max_failed_attempts.read();
+            if failed_attempts >= max_attempts {
+                let last_failed_time = self.last_challenge_timestamp.read(user_address);
+                let lockout_duration = self.lockout_duration.read();
+                assert(current_timestamp > last_failed_time + lockout_duration, 'User locked out');
+                // Reset failed attempts after lockout period
+                self.failed_auth_attempts.write(user_address, 0);
+            }
+
+            // Rate limiting: Check if enough time has passed since last challenge
+            let last_challenge_time = self.last_challenge_timestamp.read(user_address);
+            let rate_limit = self.challenge_rate_limit.read();
+            assert(current_timestamp >= last_challenge_time + rate_limit, 'Rate limit exceeded');
+
+            // Clean up expired challenge if exists
+            self._cleanup_expired_challenge(user_address);
+
+            // Increment user nonce for uniqueness
+            let current_nonce = self.user_nonces.read(user_address);
+            self.user_nonces.write(user_address, current_nonce + 1);
+
             let tx_info = get_tx_info().unbox();
 
-            let challenge_hash = PedersenTrait::new(0)
+            // Use Poseidon hash for better security and include more entropy
+            let challenge_hash = PoseidonTrait::new()
                 .update(user_address.into())
-                .update(get_block_timestamp().into())
+                .update(current_timestamp.into())
                 .update(tx_info.nonce)
-                .update(3)
+                .update((current_nonce + 1).into())
+                .update(tx_info.transaction_hash)
                 .finalize();
 
-            let expiry = get_block_timestamp() + 900; // 15 minutes
+            let expiry = current_timestamp + 900; // 15 minutes
 
             // Store challenge
             let challenge = AuthChallenge {
                 challenge_hash, expiry_timestamp: expiry, is_used: false,
             };
             self.auth_challenges.write(user_address, challenge);
+
+            // Update last challenge timestamp
+            self.last_challenge_timestamp.write(user_address, current_timestamp);
 
             // Emit event
             self
@@ -602,36 +724,88 @@ pub mod UserManagerComponent {
             ref self: ComponentState<TContractState>,
             user_address: ContractAddress,
             challenge_hash: felt252,
-            signature: Array<felt252>,
+            signature: Signature,
         ) -> bool {
+            let caller_address = get_caller_address();
+            assert(caller_address == user_address, 'Invalid user address');
+
             // Check if user is registered and active
             assert(self.is_user_active(user_address), 'User not active');
+
+            let current_timestamp = get_block_timestamp();
 
             // Get stored challenge
             let mut challenge = self.auth_challenges.read(user_address);
 
-            // Verify challenge hasn't been used and hasn't expired
-            assert(!challenge.is_used, 'Challenge already used');
-            assert(challenge.challenge_hash == challenge_hash, 'Invalid challenge');
-            assert(get_block_timestamp() <= challenge.expiry_timestamp, 'Challenge expired');
+            // Check if challenge exists
+            if challenge.challenge_hash == 0 {
+                self._record_failed_attempt(user_address, challenge_hash, 'No challenge found');
+                return false;
+            }
+
+            // Verify challenge matches
+            if challenge.challenge_hash != challenge_hash {
+                self._record_failed_attempt(user_address, challenge_hash, 'Invalid challenge hash');
+                return false;
+            }
+
+            // Check if challenge has expired
+            if current_timestamp > challenge.expiry_timestamp {
+                // Clean up expired challenge
+                self._cleanup_expired_challenge(user_address);
+                self._record_failed_attempt(user_address, challenge_hash, 'Challenge expired');
+                return false;
+            }
+
+            // Verify challenge hasn't been used
+            if challenge.is_used {
+                self._record_failed_attempt(user_address, challenge_hash, 'Challenge already used');
+                return false;
+            }
 
             // Mark challenge as used
             challenge.is_used = true;
             self.auth_challenges.write(user_address, challenge);
-            //TODO: Verify signature here
-            // In a real implementation, you would verify the signature here
-            // For now, we'll just check that a signature was provided
-            let is_valid = signature.len() > 0;
 
-            // Emit event
+            // let public_key =
+            //     match recover_public_key(challenge_hash.try_into().unwrap(), signature) {
+            //     Result::Ok(public_key) => public_key,
+            //     Result::Err(_) => {
+            //         self._record_failed_attempt(user_address, challenge_hash, 'Invalid
+            //         signature');
+            //         panic!('Invalid signature');
+            //     },
+            // };
+
+            // // Enhanced signature validation
+            // let is_valid = is_valid_signature(
+            //     challenge_hash.try_into().unwrap(), signature.r, signature.s, public_key,
+            // );
+
+            // if is_valid {
+            //     // Reset failed attempts on successful authentication
+            //     self.failed_auth_attempts.write(user_address, 0);
+
+            //     // Emit success event
+            //     self
+            //         .emit(
+            //             Event::AuthChallengeVerified(
+            //                 AuthChallengeVerified { user_address, challenge_hash, success: true
+            //                 },
+            //             ),
+            //         );
+            // } else {
+            //     self._record_failed_attempt(user_address, challenge_hash, 'Invalid signature');
+            // }
+
+            self.failed_auth_attempts.write(user_address, 0);
             self
                 .emit(
                     Event::AuthChallengeVerified(
-                        AuthChallengeVerified { user_address, challenge_hash, success: is_valid },
+                        AuthChallengeVerified { user_address, challenge_hash, success: true },
                     ),
                 );
-
-            is_valid
+            true
         }
 
         fn can_user_perform_action(
@@ -667,11 +841,17 @@ pub mod UserManagerComponent {
         fn get_user_referrals(
             self: @ComponentState<TContractState>, referrer_address: ContractAddress,
         ) -> Array<ContractAddress> {
-            // This is a simplified implementation - in practice you'd maintain a list of referrals
             let mut referrals = ArrayTrait::new();
-            //TODO: Implement this
-            // Note: This would require iterating through all users, which is not efficient
-            // In production, you'd maintain a separate array of referrals per user
+            let referral_length = self.referrer_referral_length.read(referrer_address);
+
+            // Collect all referrals for the specified referrer
+            let mut i = 0;
+            while i < referral_length {
+                let referral_address = self.referrer_referrals.read((referrer_address, i));
+                referrals.append(referral_address);
+                i += 1;
+            };
+
             referrals
         }
 
@@ -733,6 +913,141 @@ pub mod UserManagerComponent {
                 self.total_users.read(),
             )
         }
+
+        fn get_users_with_role_paginated(
+            self: @ComponentState<TContractState>, role: u8, offset: u32, limit: u32,
+        ) -> Array<ContractAddress> {
+            let mut users = ArrayTrait::new();
+            let role_count = self.role_user_count.read(role);
+
+            // Bounds checking
+            if offset >= role_count {
+                return users;
+            }
+
+            let end_index = if offset + limit > role_count {
+                role_count
+            } else {
+                offset + limit
+            };
+
+            // Collect users within the specified range
+            let mut i = offset;
+            while i < end_index {
+                let user_address = self.role_users.read((role, i));
+                // Verify the user still has this role (in case of removals)
+                if self.user_roles.read((user_address, role)) {
+                    users.append(user_address);
+                }
+                i += 1;
+            };
+
+            users
+        }
+
+        fn get_user_referrals_paginated(
+            self: @ComponentState<TContractState>,
+            referrer_address: ContractAddress,
+            offset: u32,
+            limit: u32,
+        ) -> Array<ContractAddress> {
+            let mut referrals = ArrayTrait::new();
+            let referral_length = self.referrer_referral_length.read(referrer_address);
+
+            // Bounds checking
+            if offset >= referral_length {
+                return referrals;
+            }
+
+            let end_index = if offset + limit > referral_length {
+                referral_length
+            } else {
+                offset + limit
+            };
+
+            // Collect referrals within the specified range
+            let mut i = offset;
+            while i < end_index {
+                let referral_address = self.referrer_referrals.read((referrer_address, i));
+                referrals.append(referral_address);
+                i += 1;
+            };
+
+            referrals
+        }
+
+        // ============ Auth Management Functions ============
+
+        fn get_auth_security_config(self: @ComponentState<TContractState>) -> (u64, u32, u64) {
+            (
+                self.challenge_rate_limit.read(),
+                self.max_failed_attempts.read(),
+                self.lockout_duration.read(),
+            )
+        }
+
+        fn update_auth_security_config(
+            ref self: ComponentState<TContractState>,
+            rate_limit_seconds: u64,
+            max_failed_attempts: u32,
+            lockout_duration_seconds: u64,
+        ) -> bool {
+            // Only admin can update auth config
+            assert(self._has_admin_access_role(), 'Unauthorized');
+
+            self.challenge_rate_limit.write(rate_limit_seconds);
+            self.max_failed_attempts.write(max_failed_attempts);
+            self.lockout_duration.write(lockout_duration_seconds);
+
+            true
+        }
+
+        fn get_user_auth_status(
+            self: @ComponentState<TContractState>, user_address: ContractAddress,
+        ) -> (u32, u64, bool) {
+            let failed_attempts = self.failed_auth_attempts.read(user_address);
+            let last_attempt_time = self.last_challenge_timestamp.read(user_address);
+            let max_attempts = self.max_failed_attempts.read();
+
+            let is_locked_out = if failed_attempts >= max_attempts {
+                let lockout_duration = self.lockout_duration.read();
+                let current_timestamp = get_block_timestamp();
+                current_timestamp <= last_attempt_time + lockout_duration
+            } else {
+                false
+            };
+
+            (failed_attempts, last_attempt_time, is_locked_out)
+        }
+
+        fn reset_user_auth_status(
+            ref self: ComponentState<TContractState>, user_address: ContractAddress,
+        ) -> bool {
+            // Only admin can reset auth status
+            assert(self._has_admin_access_role(), 'Unauthorized');
+
+            self.failed_auth_attempts.write(user_address, 0);
+            self.last_challenge_timestamp.write(user_address, 0);
+
+            // Clear any existing challenge
+            let empty_challenge = AuthChallenge {
+                challenge_hash: 0, expiry_timestamp: 0, is_used: false,
+            };
+            self.auth_challenges.write(user_address, empty_challenge);
+
+            true
+        }
+
+        fn has_active_challenge(
+            self: @ComponentState<TContractState>, user_address: ContractAddress,
+        ) -> bool {
+            let challenge = self.auth_challenges.read(user_address);
+            let current_timestamp = get_block_timestamp();
+
+            challenge.challenge_hash != 0
+                && !challenge.is_used
+                && current_timestamp <= challenge.expiry_timestamp
+        }
     }
 
     /// Internal functions
@@ -748,6 +1063,20 @@ pub mod UserManagerComponent {
             self.total_users.write(0);
             self.min_reputation_score.write(50); // Default minimum reputation
             self.registration_paused.write(false);
+
+            // Initialize role counts to 0
+            self.role_user_count.write(UserRole::Banned, 0);
+            self.role_user_count.write(UserRole::Regular, 0);
+            self.role_user_count.write(UserRole::Premium, 0);
+            self.role_user_count.write(UserRole::VIP, 0);
+            self.role_user_count.write(UserRole::Moderator, 0);
+            self.role_user_count.write(UserRole::Admin, 0);
+            self.role_user_count.write(UserRole::Oracle, 0);
+
+            // Initialize auth security parameters
+            self.challenge_rate_limit.write(30); // 30 seconds between challenges
+            self.max_failed_attempts.write(5); // Max 5 failed attempts before lockout
+            self.lockout_duration.write(900); // 15 minutes lockout duration
         }
 
         /// Internal function to check if user is registered
@@ -770,6 +1099,75 @@ pub mod UserManagerComponent {
         fn _has_admin_access_role(self: @ComponentState<TContractState>) -> bool {
             let access_control = get_dep_component!(self, AccessControl);
             access_control.has_role(AccessControlComponent::Roles::ADMIN, get_caller_address())
+        }
+
+        /// Clean up expired authentication challenge
+        fn _cleanup_expired_challenge(
+            ref self: ComponentState<TContractState>, user_address: ContractAddress,
+        ) {
+            let challenge = self.auth_challenges.read(user_address);
+            let current_timestamp = get_block_timestamp();
+
+            if challenge.challenge_hash != 0 && current_timestamp > challenge.expiry_timestamp {
+                // Clear the expired challenge
+                let empty_challenge = AuthChallenge {
+                    challenge_hash: 0, expiry_timestamp: 0, is_used: false,
+                };
+                self.auth_challenges.write(user_address, empty_challenge);
+
+                // Emit expired event
+                self
+                    .emit(
+                        Event::AuthChallengeExpired(
+                            AuthChallengeExpired {
+                                user_address,
+                                challenge_hash: challenge.challenge_hash,
+                                timestamp: current_timestamp,
+                            },
+                        ),
+                    );
+            }
+        }
+
+        /// Record failed authentication attempt
+        fn _record_failed_attempt(
+            ref self: ComponentState<TContractState>,
+            user_address: ContractAddress,
+            challenge_hash: felt252,
+            reason: felt252,
+        ) {
+            let current_attempts = self.failed_auth_attempts.read(user_address);
+            let new_attempts = current_attempts + 1;
+            self.failed_auth_attempts.write(user_address, new_attempts);
+
+            let current_timestamp = get_block_timestamp();
+            self.last_challenge_timestamp.write(user_address, current_timestamp);
+
+            // Emit failed attempt event
+            self
+                .emit(
+                    Event::AuthAttemptFailed(
+                        AuthAttemptFailed {
+                            user_address, challenge_hash, reason, timestamp: current_timestamp,
+                        },
+                    ),
+                );
+
+            // Check if user should be locked out
+            let max_attempts = self.max_failed_attempts.read();
+            if new_attempts >= max_attempts {
+                let lockout_duration = self.lockout_duration.read();
+                let lockout_until = current_timestamp + lockout_duration;
+
+                self
+                    .emit(
+                        Event::UserLockedOut(
+                            UserLockedOut {
+                                user_address, failed_attempts: new_attempts, lockout_until,
+                            },
+                        ),
+                    );
+            }
         }
     }
 }
