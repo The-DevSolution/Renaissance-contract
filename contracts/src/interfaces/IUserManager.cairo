@@ -2,7 +2,7 @@ use starknet::ContractAddress;
 use core::array::Array;
 
 /// User profile data structure
-#[derive(Drop, Serde, starknet::Store)]
+#[derive(Drop, Serde, starknet::Store, Clone)]
 pub struct UserProfile {
     pub user_address: ContractAddress,
     pub username: felt252,
@@ -27,14 +27,14 @@ pub struct RegistrationParams {
 /// User role enumeration
 #[allow(starknet::store_no_default_variant)]
 #[derive(Drop, Serde, starknet::Store)]
-pub enum UserRole {
-    Banned,
-    Regular,
-    Premium,
-    VIP,
-    Moderator,
-    Admin,
-    Oracle,
+pub mod UserRole {
+    pub const Banned: u8 = 0;
+    pub const Regular: u8 = 1;
+    pub const Premium: u8 = 2;
+    pub const VIP: u8 = 3;
+    pub const Moderator: u8 = 4;
+    pub const Admin: u8 = 5;
+    pub const Oracle: u8 = 6;
 }
 
 /// Authentication challenge structure
@@ -125,29 +125,29 @@ pub trait IUserManager<TState> {
     /// @param user_address: The user's wallet address
     /// @param role: The role to assign
     /// @return success: Boolean indicating successful role assignment
-    fn assign_user_role(ref self: TState, user_address: ContractAddress, role: UserRole) -> bool;
+    fn assign_user_role(ref self: TState, user_address: ContractAddress, role: u8) -> bool;
 
     /// Remove a role from a user (admin only)
     /// @param user_address: The user's wallet address
     /// @param role: The role to remove
     /// @return success: Boolean indicating successful role removal
-    fn remove_user_role(ref self: TState, user_address: ContractAddress, role: UserRole) -> bool;
+    fn remove_user_role(ref self: TState, user_address: ContractAddress, role: u8) -> bool;
 
     /// Check if user has a specific role
     /// @param user_address: The user's wallet address
     /// @param role: The role to check
     /// @return has_role: Boolean indicating if user has the role
-    fn user_has_role(self: @TState, user_address: ContractAddress, role: UserRole) -> bool;
+    fn user_has_role(self: @TState, user_address: ContractAddress, role: u8) -> bool;
 
     /// Get all roles for a user
     /// @param user_address: The user's wallet address
     /// @return roles: Array of user roles
-    fn get_user_roles(self: @TState, user_address: ContractAddress) -> Array<UserRole>;
+    fn get_user_roles(self: @TState, user_address: ContractAddress) -> Array<u8>;
 
     /// Get users with a specific role
     /// @param role: The role to search for
     /// @return users: Array of user addresses with the role
-    fn get_users_with_role(self: @TState, role: UserRole) -> Array<ContractAddress>;
+    fn get_users_with_role(self: @TState, role: u8) -> Array<ContractAddress>;
 
     // ============ Reputation & Statistics ============
 
@@ -196,7 +196,7 @@ pub trait IUserManager<TState> {
     /// @param required_role: Minimum role required for the action
     /// @return can_perform: Boolean indicating if user can perform the action
     fn can_user_perform_action(
-        self: @TState, user_address: ContractAddress, required_role: UserRole,
+        self: @TState, user_address: ContractAddress, required_role: u8,
     ) -> bool;
 
     // ============ Referral System ============
